@@ -40,6 +40,8 @@ RUN git clone --quiet --depth 1 --branch "$ZIGQUERY_TAG" https://github.com/Reci
  && (git submodule update --init --depth 1 third_party/googlesql || git submodule update --init third_party/googlesql) \
  && test "$(git -C third_party/googlesql rev-parse HEAD)" = "$GOOGLESQL_COMMIT"
 WORKDIR /work/source
+# dependencies are fetched before the long compile, so an unreachable host fails the build in minutes.
+RUN zig build --fetch
 RUN bazel build -c opt --jobs="$BAZEL_JOBS" --local_resources=cpu="$BAZEL_JOBS" \
       //shim:libgooglesql_shim.so //shim:libgooglesql_shim_static_linux \
  && mkdir -p dist/shim \
