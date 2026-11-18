@@ -1,0 +1,114 @@
+name: Build image
+
+# Compiles ZigQuery from the source commit pinned in the Dockerfile and publishes it. The compile takes over an hour.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yaml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+
+      - name: Size the compile to the runner
+        id: size
+        run: |
+          set -euo pipefail
+          cores="$(nproc)"
+          memory_gib="$(awk '/MemTotal/ {printf "%d", $2 / 1048576}' /proc/meminfo)"
+          by_cores=$(( cores * 7 / 10 ))
+          by_memory=$(( memory_gib / 5 ))
+          jobs=$(( by_cores < by_memory ? by_cores : by_memory ))
+          [ "$jobs" -lt 1 ] && jobs=1
+          echo "runner has $cores cores and $memory_gib GiB; compiling with $jobs jobs" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          BAZEL_JOBS: ${{ steps.size.outputs.jobs }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY,,}"
+          version="$(sed -n 's/^ARG ZIGQUERY_TAG=//p' Dockerfile)"
+          docker buildx build . \
+            --platform "linux/$ARCHITECTURE" \
+            --build-arg BAZEL_JOBS="$BAZEL_JOBS" \
+            --label "org.opencontainers.image.source=$SOURCE_URL" \
+            --provenance=mode=max --sbom=true \
+            --tag "$image:$version-$ARCHITECTURE" \
+            --push
+
+  manifest:
+    name: publish the multi-architecture tag
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to the registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+
+      - name: Join the two architectures under one tag
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY,,}"
+          version="$(sed -n 's/^ARG ZIGQUERY_TAG=//p' Dockerfile)"
+          commit="$(sed -n 's/^ARG ZIGQUERY_COMMIT=//p' Dockerfile)"
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.description=ZigQuery $version (Recidiviz/ZigQuery@$commit) built from source, unmodified" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE_URL" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            --tag "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
+          digest="$(docker buildx imagetools inspect "$image:$version" --format '{{json .Manifest}}' | sed -n 's/.*"digest":"\(sha256:[a-f0-9]*\)".*/\1/p')"
+          echo "published $image:$version@$digest" | tee -a "$GITHUB_STEP_SUMMARY"
